@@ -15,6 +15,8 @@ def _migrate():
             conn.execute(text("ALTER TABLE servers ADD COLUMN connection_type VARCHAR(10) DEFAULT 'winrm'"))
         if "ssh_port" not in cols:
             conn.execute(text("ALTER TABLE servers ADD COLUMN ssh_port INTEGER DEFAULT 22"))
+        if "scan_data" not in cols:
+            conn.execute(text("ALTER TABLE servers ADD COLUMN scan_data TEXT"))
 
 _migrate()
 

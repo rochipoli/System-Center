@@ -1,12 +1,12 @@
-import { useState } from "react";
-import { X, Cpu, ScrollText, Settings2, Package, AlertCircle, Loader2, Key, PlayCircle } from "lucide-react";
+import { useState, useEffect } from "react";
+import { X, Cpu, ScrollText, Settings2, Package, Network, AlertCircle, Loader2, Key, PlayCircle } from "lucide-react";
 import {
   api, type Server, type ResourceInfo, type LogsInfo,
-  type ConfigInfo, type SoftwareInfo,
+  type ConfigInfo, type SoftwareInfo, type PortsInfo,
 } from "../api/client";
 
-type Tab = "resources" | "logs" | "configuration" | "software";
-const TABS: Tab[] = ["resources", "logs", "configuration", "software"];
+type Tab = "resources" | "logs" | "configuration" | "software" | "ports";
+const TABS: Tab[] = ["resources", "logs", "configuration", "software", "ports"];
 
 interface Props {
   server: Server;
@@ -31,6 +31,20 @@ export default function ScanModal({ server, onClose, onScanned }: Props) {
   const [logs, setLogs]                 = useState<LogsInfo | null>(null);
   const [config, setConfig]             = useState<ConfigInfo | null>(null);
   const [software, setSoftware]         = useState<SoftwareInfo | null>(null);
+  const [ports, setPorts]               = useState<PortsInfo | null>(null);
+  const [storedAt, setStoredAt]         = useState<string | null>(null);
+
+  useEffect(() => {
+    api.scan.results(server.id).then((stored) => {
+      if (!stored) return;
+      if (stored.resources)     setResources(stored.resources);
+      if (stored.logs)          setLogs(stored.logs);
+      if (stored.configuration) setConfig(stored.configuration);
+      if (stored.software)      setSoftware(stored.software);
+      if (stored.ports)         setPorts(stored.ports);
+      if (stored.last_scanned)  setStoredAt(stored.last_scanned);
+    }).catch(() => {/* no stored data yet */});
+  }, [server.id]);
 
   const validate = (): boolean => {
     if (!username) { setCredError("Username is required"); return false; }
@@ -51,6 +65,7 @@ export default function ScanModal({ server, onClose, onScanned }: Props) {
       setLogs(result.logs);
       setConfig(result.configuration);
       setSoftware(result.software);
+      setPorts(result.ports);
       onScanned();
     } finally {
       setScanningAll(false);
@@ -66,6 +81,7 @@ export default function ScanModal({ server, onClose, onScanned }: Props) {
       if (tab === "logs")          setLogs(await api.scan.logs(server.id, creds()));
       if (tab === "configuration") setConfig(await api.scan.configuration(server.id, creds()));
       if (tab === "software")      setSoftware(await api.scan.software(server.id, creds()));
+      if (tab === "ports")         setPorts(await api.scan.ports(server.id, creds()));
       onScanned();
     } finally {
       setLoadingTab(null);
@@ -77,6 +93,7 @@ export default function ScanModal({ server, onClose, onScanned }: Props) {
     if (tab === "logs")          return !!logs;
     if (tab === "configuration") return !!config;
     if (tab === "software")      return !!software;
+    if (tab === "ports")         return !!ports;
   };
 
   const tabHasError = (tab: Tab) => {
@@ -84,6 +101,7 @@ export default function ScanModal({ server, onClose, onScanned }: Props) {
     if (tab === "logs")          return !!logs?.error;
     if (tab === "configuration") return !!config?.error;
     if (tab === "software")      return !!software?.error;
+    if (tab === "ports")         return !!ports?.error;
   };
 
   const tabLoading = (tab: Tab) => scanningAll || loadingTab === tab;
@@ -103,7 +121,14 @@ export default function ScanModal({ server, onClose, onScanned }: Props) {
                 {isSSH ? `SSH :${server.ssh_port}` : `WinRM :${server.winrm_port}`}
               </span>
             </div>
-            {server.ip_address && <p className="text-xs text-gray-500">{server.ip_address}</p>}
+            <div className="flex items-center gap-3 mt-0.5">
+              {server.ip_address && <p className="text-xs text-gray-500">{server.ip_address}</p>}
+              {storedAt && (
+                <p className="text-xs text-gray-400">
+                  Last scan: {new Date(storedAt).toLocaleString()}
+                </p>
+              )}
+            </div>
           </div>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={20} /></button>
         </div>
@@ -169,7 +194,7 @@ export default function ScanModal({ server, onClose, onScanned }: Props) {
         {/* Tabs */}
         <div className="flex border-b shrink-0 px-6">
           {TABS.map((tab) => {
-            const Icon = { resources: Cpu, logs: ScrollText, configuration: Settings2, software: Package }[tab];
+            const Icon = ({ resources: Cpu, logs: ScrollText, configuration: Settings2, software: Package, ports: Network } as Record<Tab, typeof Cpu>)[tab];
             const hasData = tabHasData(tab);
             const hasError = tabHasError(tab);
             const isLoading = tabLoading(tab);
@@ -201,6 +226,9 @@ export default function ScanModal({ server, onClose, onScanned }: Props) {
           )}
           {activeTab === "software" && (
             <SoftwareTab data={software} loading={tabLoading("software")} onScan={() => scanOne("software")} />
+          )}
+          {activeTab === "ports" && (
+            <PortsTab data={ports} loading={tabLoading("ports")} onScan={() => scanOne("ports")} />
           )}
         </div>
       </div>
@@ -440,6 +468,77 @@ function SoftwareTab({ data, loading, onScan }: { data: SoftwareInfo | null; loa
         </div>
       )}
       {!data && !loading && <EmptyState msg="Run Scan All or click Rescan to list installed software." onScan={onScan} loading={loading} />}
+    </div>
+  );
+}
+
+function PortsTab({ data, loading, onScan }: { data: PortsInfo | null; loading: boolean; onScan: () => void }) {
+  const [filter, setFilter] = useState("");
+  const [protoFilter, setProtoFilter] = useState<"ALL" | "TCP" | "UDP">("ALL");
+
+  const filtered = data?.ports.filter((p) => {
+    const matchProto = protoFilter === "ALL" || p.protocol === protoFilter;
+    const matchText = !filter || String(p.port).includes(filter) || p.process.toLowerCase().includes(filter.toLowerCase());
+    return matchProto && matchText;
+  }) ?? [];
+
+  return (
+    <div className="space-y-4">
+      <TabHeader title="Open Ports">
+        {data && <ScanButton onClick={onScan} loading={loading} />}
+      </TabHeader>
+      {data?.error && <ErrorBox msg={data.error} />}
+      {data && !data.error && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <p className="text-xs text-gray-500">{data.ports.length} listening ports</p>
+            <div className="flex items-center gap-2">
+              <div className="flex rounded-lg overflow-hidden border border-gray-300 text-xs">
+                {(["ALL", "TCP", "UDP"] as const).map((p) => (
+                  <button key={p} onClick={() => setProtoFilter(p)}
+                    className={`px-2.5 py-1 transition-colors ${protoFilter === p ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-100"}`}>
+                    {p}
+                  </button>
+                ))}
+              </div>
+              <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Port or process…"
+                className="border border-gray-300 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 w-44" />
+            </div>
+          </div>
+          <div className="overflow-x-auto rounded-lg border border-gray-200">
+            <table className="w-full text-xs">
+              <thead className="bg-gray-50 border-b border-gray-200">
+                <tr>
+                  <th className="px-3 py-2 text-left font-semibold text-gray-500 uppercase tracking-wide w-20">Port</th>
+                  <th className="px-3 py-2 text-left font-semibold text-gray-500 uppercase tracking-wide w-16">Proto</th>
+                  <th className="px-3 py-2 text-left font-semibold text-gray-500 uppercase tracking-wide w-20">State</th>
+                  <th className="px-3 py-2 text-left font-semibold text-gray-500 uppercase tracking-wide">Process</th>
+                  <th className="px-3 py-2 text-left font-semibold text-gray-500 uppercase tracking-wide w-20">PID</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {filtered.map((p, i) => (
+                  <tr key={i} className="hover:bg-gray-50">
+                    <td className="px-3 py-2 font-mono font-semibold text-gray-800">{p.port}</td>
+                    <td className="px-3 py-2">
+                      <span className={`font-medium px-1.5 py-0.5 rounded text-xs ${
+                        p.protocol === "TCP" ? "bg-blue-100 text-blue-700" : "bg-orange-100 text-orange-700"
+                      }`}>{p.protocol}</span>
+                    </td>
+                    <td className="px-3 py-2 text-gray-500">{p.state || "—"}</td>
+                    <td className="px-3 py-2 text-gray-700 font-mono">{p.process || "—"}</td>
+                    <td className="px-3 py-2 text-gray-400">{p.process_id ?? "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {filtered.length === 0 && (
+              <p className="text-center py-6 text-gray-400 text-xs">No ports match your filter.</p>
+            )}
+          </div>
+        </div>
+      )}
+      {!data && !loading && <EmptyState msg="Run Scan All or click Rescan to list open ports." onScan={onScan} loading={loading} />}
     </div>
   );
 }

@@ -94,11 +94,34 @@ export interface SoftwareInfo {
   error: string | null;
 }
 
+export interface PortEntry {
+  port: number;
+  protocol: string;
+  state: string;
+  process_id: number | null;
+  process: string;
+}
+
+export interface PortsInfo {
+  ports: PortEntry[];
+  error: string | null;
+}
+
 export interface ScanAllResult {
   resources: ResourceInfo;
   logs: LogsInfo;
   configuration: ConfigInfo;
   software: SoftwareInfo;
+  ports: PortsInfo;
+}
+
+export interface StoredScanData {
+  resources: ResourceInfo | null;
+  logs: LogsInfo | null;
+  configuration: ConfigInfo | null;
+  software: SoftwareInfo | null;
+  ports: PortsInfo | null;
+  last_scanned: string | null;
 }
 
 const BASE = "/api";
@@ -161,5 +184,12 @@ export const api = {
         method: "POST",
         body: JSON.stringify(creds),
       }),
+    ports: (id: number, creds: ScanCredentials) =>
+      request<PortsInfo>(`/servers/${id}/scan/ports`, {
+        method: "POST",
+        body: JSON.stringify(creds),
+      }),
+    results: (id: number) =>
+      request<StoredScanData | null>(`/servers/${id}/scan/results`),
   },
 };

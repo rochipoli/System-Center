@@ -13,7 +13,8 @@ from database import get_db
 from models import Server
 from schemas import (
     ScanCredentials, ResourceInfo, LogsInfo, ConfigInfo,
-    SoftwareInfo, SoftwarePackage, ScanAllResult,
+    SoftwareInfo, SoftwarePackage, PortEntry, PortsInfo, ScanAllResult,
+    StoredScanData,
 )
 
 router = APIRouter(prefix="/api/servers/{server_id}/scan", tags=["scans"])
@@ -76,6 +77,24 @@ $svcs = Get-Service | Select-Object @{n='name';e={$_.Name}},
     processors        = $cpus
     services_json     = $svcs
 } | ConvertTo-Json -Compress
+"""
+
+PS_PORTS = r"""
+$r = @()
+try {
+    $r += @(Get-NetTCPConnection -State Listen -EA SilentlyContinue | ForEach-Object {
+        $pn = try { (Get-Process -Id $_.OwningProcess -EA SilentlyContinue).ProcessName } catch { '' }
+        [PSCustomObject]@{ port=$_.LocalPort; protocol='TCP'; state='LISTEN'; process_id=$_.OwningProcess; process=if($pn){$pn}else{''} }
+    })
+} catch {}
+try {
+    $r += @(Get-NetUDPEndpoint -EA SilentlyContinue | ForEach-Object {
+        $pn = try { (Get-Process -Id $_.OwningProcess -EA SilentlyContinue).ProcessName } catch { '' }
+        [PSCustomObject]@{ port=$_.LocalPort; protocol='UDP'; state=''; process_id=$_.OwningProcess; process=if($pn){$pn}else{''} }
+    })
+} catch {}
+$seen = @{}
+@($r | Sort-Object port | Where-Object { $k = "$($_.port)-$($_.protocol)"; if (-not $seen[$k]) { $seen[$k]=$true; $true } else { $false } }) | ConvertTo-Json -Compress
 """
 
 PS_SOFTWARE = r"""
@@ -294,6 +313,52 @@ except: pass
 print(json.dumps(r))
 """)
 
+SSH_PORTS = textwrap.dedent("""\
+import json, subprocess, platform, re
+S = platform.system()
+ports = []
+try:
+    if S == 'Darwin':
+        for proto, args, st in [('TCP',['-iTCP','-sTCP:LISTEN'],'LISTEN'),('UDP',['-iUDP'],'')]:
+            try:
+                o = subprocess.check_output(['lsof']+args+['-n','-P'], text=True, stderr=subprocess.DEVNULL)
+                for l in o.splitlines()[1:]:
+                    p = l.split()
+                    if len(p) >= 9:
+                        m = re.search(r':(\\d+)$', p[8])
+                        if m:
+                            try: ports.append({'port':int(m.group(1)),'protocol':proto,'state':st,'process_id':int(p[1]),'process':p[0]})
+                            except: pass
+            except: pass
+    else:
+        for proto, args in [('TCP',['-tlnp']),('UDP',['-ulnp'])]:
+            try:
+                o = subprocess.check_output(['ss']+args, text=True, stderr=subprocess.DEVNULL)
+                for l in o.splitlines()[1:]:
+                    p = l.split()
+                    if len(p) < 4: continue
+                    m = re.search(r':(\\d+)$', p[3])
+                    if m:
+                        pid, proc = None, ''
+                        rest = ' '.join(p[5:]) if len(p) > 5 else ''
+                        pm = re.search(r'pid=(\\d+)', rest)
+                        nm = re.search(r'"([^"]+)"', rest)
+                        if pm: pid = int(pm.group(1))
+                        if nm: proc = nm.group(1)
+                        ports.append({'port':int(m.group(1)),'protocol':proto,'state':'LISTEN','process_id':pid,'process':proc})
+            except: pass
+except Exception as e:
+    print(json.dumps({'ports':[],'error':str(e)})); raise SystemExit
+seen = set()
+deduped = []
+for p in sorted(ports, key=lambda x: x['port']):
+    k = (p['port'], p['protocol'])
+    if k not in seen:
+        seen.add(k)
+        deduped.append(p)
+print(json.dumps({'ports': deduped}))
+""")
+
 SSH_SOFTWARE = textwrap.dedent("""\
 import json, subprocess, platform, os
 S = platform.system()
@@ -340,6 +405,13 @@ print(json.dumps({'packages':pkgs}))
 def _mark_scan(db: Session, server: Server, status: str):
     server.scan_status = status
     server.last_scanned = datetime.now(timezone.utc)
+    db.commit()
+
+
+def _persist_scan_data(db: Session, server: Server, updates: dict):
+    existing = json.loads(server.scan_data) if server.scan_data else {}
+    existing.update(updates)
+    server.scan_data = json.dumps(existing)
     db.commit()
 
 
@@ -488,6 +560,27 @@ def _ssh_software(client: paramiko.SSHClient) -> SoftwareInfo:
         return SoftwareInfo(error=str(e))
 
 
+def _winrm_ports(server: Server, creds: ScanCredentials) -> PortsInfo:
+    try:
+        raw = _run_ps(_winrm_session(server, creds), PS_PORTS)
+        items = json.loads(raw) if raw and raw != "null" else []
+        if isinstance(items, dict):
+            items = [items]
+        return PortsInfo(ports=[PortEntry(**p) for p in items if p.get("port")])
+    except Exception as e:
+        return PortsInfo(error=str(e))
+
+
+def _ssh_ports(client: paramiko.SSHClient) -> PortsInfo:
+    try:
+        data = json.loads(_run_ssh_python(client, SSH_PORTS))
+        if "error" in data and not data.get("ports"):
+            return PortsInfo(error=data["error"])
+        return PortsInfo(ports=[PortEntry(**p) for p in data.get("ports", [])])
+    except Exception as e:
+        return PortsInfo(error=str(e))
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -506,16 +599,17 @@ def scan_all(server_id: int, creds: ScanCredentials, db: Session = Depends(get_d
     if server.connection_type == "ssh":
         try:
             client = _ssh_client(server, creds)
-            # All four scripts run as independent channels on the same SSH transport
-            with ThreadPoolExecutor(max_workers=4) as pool:
+            with ThreadPoolExecutor(max_workers=5) as pool:
                 f_res  = pool.submit(_ssh_resources, client)
                 f_logs = pool.submit(_ssh_logs,      client)
                 f_conf = pool.submit(_ssh_config,    client)
                 f_sw   = pool.submit(_ssh_software,  client)
+                f_pts  = pool.submit(_ssh_ports,     client)
                 resources     = f_res.result()
                 logs          = f_logs.result()
                 configuration = f_conf.result()
                 software      = f_sw.result()
+                ports         = f_pts.result()
             client.close()
         except Exception as e:
             _mark_scan(db, server, "error")
@@ -525,27 +619,43 @@ def scan_all(server_id: int, creds: ScanCredentials, db: Session = Depends(get_d
                 logs=LogsInfo(error=err),
                 configuration=ConfigInfo(error=err),
                 software=SoftwareInfo(error=err),
+                ports=PortsInfo(error=err),
             )
     else:
         # WinRM: each helper opens its own HTTP session (WinRM is stateless)
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=5) as pool:
             f_res  = pool.submit(_winrm_resources, server, creds)
             f_logs = pool.submit(_winrm_logs,      server, creds)
             f_conf = pool.submit(_winrm_config,    server, creds)
             f_sw   = pool.submit(_winrm_software,  server, creds)
+            f_pts  = pool.submit(_winrm_ports,     server, creds)
             resources     = f_res.result()
             logs          = f_logs.result()
             configuration = f_conf.result()
             software      = f_sw.result()
+            ports         = f_pts.result()
 
-    any_error = any(x.error for x in [resources, logs, configuration, software])
+    any_error = any(x.error for x in [resources, logs, configuration, software, ports])
     _mark_scan(db, server, "error" if any_error else "success")
-    return ScanAllResult(
+    result = ScanAllResult(
         resources=resources,
         logs=logs,
         configuration=configuration,
         software=software,
+        ports=ports,
     )
+    _persist_scan_data(db, server, result.model_dump())
+    return result
+
+
+@router.get("/results", response_model=StoredScanData | None)
+def get_scan_results(server_id: int, db: Session = Depends(get_db)):
+    server = _get_server(server_id, db)
+    if not server.scan_data:
+        return None
+    data = json.loads(server.scan_data)
+    data["last_scanned"] = server.last_scanned
+    return StoredScanData(**data)
 
 
 @router.post("/resources", response_model=ResourceInfo)
@@ -558,6 +668,7 @@ def scan_resources(server_id: int, creds: ScanCredentials, db: Session = Depends
     else:
         result = _winrm_resources(server, creds)
     _mark_scan(db, server, "error" if result.error else "success")
+    _persist_scan_data(db, server, {"resources": result.model_dump()})
     return result
 
 
@@ -571,6 +682,7 @@ def scan_logs(server_id: int, creds: ScanCredentials, db: Session = Depends(get_
     else:
         result = _winrm_logs(server, creds)
     _mark_scan(db, server, "error" if result.error else "success")
+    _persist_scan_data(db, server, {"logs": result.model_dump()})
     return result
 
 
@@ -584,6 +696,7 @@ def scan_configuration(server_id: int, creds: ScanCredentials, db: Session = Dep
     else:
         result = _winrm_config(server, creds)
     _mark_scan(db, server, "error" if result.error else "success")
+    _persist_scan_data(db, server, {"configuration": result.model_dump()})
     return result
 
 
@@ -597,4 +710,19 @@ def scan_software(server_id: int, creds: ScanCredentials, db: Session = Depends(
     else:
         result = _winrm_software(server, creds)
     _mark_scan(db, server, "error" if result.error else "success")
+    _persist_scan_data(db, server, {"software": result.model_dump()})
+    return result
+
+
+@router.post("/ports", response_model=PortsInfo)
+def scan_ports(server_id: int, creds: ScanCredentials, db: Session = Depends(get_db)):
+    server = _get_server(server_id, db)
+    if server.connection_type == "ssh":
+        client = _ssh_client(server, creds)
+        result = _ssh_ports(client)
+        client.close()
+    else:
+        result = _winrm_ports(server, creds)
+    _mark_scan(db, server, "error" if result.error else "success")
+    _persist_scan_data(db, server, {"ports": result.model_dump()})
     return result

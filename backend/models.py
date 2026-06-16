@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import String, DateTime, func
+from sqlalchemy import String, DateTime, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 from database import Base
 
@@ -24,3 +24,4 @@ class Server(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     last_scanned: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     scan_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    scan_data: Mapped[str | None] = mapped_column(Text, nullable=True)

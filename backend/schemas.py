@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 from pydantic import BaseModel
 
 
@@ -94,8 +95,31 @@ class SoftwareInfo(BaseModel):
     error: str | None = None
 
 
+class PortEntry(BaseModel):
+    port: int
+    protocol: str
+    state: str = ""
+    process_id: int | None = None
+    process: str = ""
+
+
+class PortsInfo(BaseModel):
+    ports: list[PortEntry] = []
+    error: str | None = None
+
+
 class ScanAllResult(BaseModel):
     resources: ResourceInfo
     logs: LogsInfo
     configuration: ConfigInfo
     software: SoftwareInfo
+    ports: PortsInfo
+
+
+class StoredScanData(BaseModel):
+    resources: Optional[ResourceInfo] = None
+    logs: Optional[LogsInfo] = None
+    configuration: Optional[ConfigInfo] = None
+    software: Optional[SoftwareInfo] = None
+    ports: Optional[PortsInfo] = None
+    last_scanned: Optional[datetime] = None
